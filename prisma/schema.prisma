@@ -1,0 +1,17 @@
+// SKAFF Academy — Prisma schema
+//
+// This is the backend FOUNDATION phase: Prisma is wired up and validated
+// against PostgreSQL, but the Academy domain (User, StudentProfile,
+// StaffProfile, Program, Intake, ClassGroup, Enrollment, Application, ...)
+// is intentionally not modeled yet. See README.md → "Planned Backend
+// Modules" and "Domain Contract" for the entity names and enums the
+// frontend already depends on and that future migrations must align with.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}

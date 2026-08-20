@@ -1,0 +1,39 @@
+# compiled output
+/dist
+/node_modules
+/build
+
+# logs
+logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+
+# environment
+.env
+.env.local
+.env.*.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDEs
+.idea
+.vscode/*
+!.vscode/extensions.json
+
+# tests
+/coverage
+/.nyc_output
+
+# prisma
+prisma/*.db
+prisma/generated
+
+# misc
+*.tsbuildinfo
+.swc
