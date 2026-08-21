@@ -15,3 +15,165 @@ datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
 }
+
+enum UserType {
+  STUDENT
+  STAFF
+}
+
+enum StudentStatus {
+  ACTIVE
+  PENDING_PAYMENT
+  ON_HOLD
+  SUSPENDED
+  COMPLETED
+  WITHDRAWN
+}
+
+enum StaffStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum IntakeStatus {
+  UPCOMING
+  ACTIVE
+  COMPLETED
+  CANCELLED
+}
+
+enum ClassStatus {
+  UPCOMING
+  ACTIVE
+  COMPLETED
+  CANCELLED
+}
+
+enum EnrollmentStatus {
+  ACTIVE
+  COMPLETED
+  WITHDRAWN
+  SUSPENDED
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  userType     UserType
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  studentProfile StudentProfile?
+  staffProfile   StaffProfile?
+}
+
+model StudentProfile {
+  id            String        @id @default(cuid())
+  userId        String        @unique
+  studentNumber String        @unique
+  fullName      String
+  phone         String?
+  dateOfBirth   DateTime?
+  nationality   String?
+  address       String?
+  status        StudentStatus @default(ACTIVE)
+  statusMessage String?
+  internalNotes String?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  enrollments Enrollment[]
+}
+
+model StaffProfile {
+  id        String      @id @default(cuid())
+  userId    String      @unique
+  fullName  String
+  phone     String?
+  status    StaffStatus @default(ACTIVE)
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+
+  user    User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  classes ClassGroup[]
+}
+
+model Program {
+  id          String   @id @default(cuid())
+  name        String
+  slug        String   @unique
+  code        String   @unique
+  description String?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  intakes     Intake[]
+  classGroups ClassGroup[]
+  enrollments Enrollment[]
+}
+
+model Intake {
+  id        String       @id @default(cuid())
+  name      String
+  programId String
+  status    IntakeStatus @default(UPCOMING)
+  startDate DateTime?
+  endDate   DateTime?
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+
+  program     Program      @relation(fields: [programId], references: [id], onDelete: Restrict)
+  classGroups ClassGroup[]
+  enrollments Enrollment[]
+
+  @@index([programId])
+}
+
+model ClassGroup {
+  id        String      @id @default(cuid())
+  name      String
+  code      String      @unique
+  programId String
+  intakeId  String
+  trainerId String?
+  status    ClassStatus @default(UPCOMING)
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+
+  program     Program       @relation(fields: [programId], references: [id], onDelete: Restrict)
+  intake      Intake        @relation(fields: [intakeId], references: [id], onDelete: Restrict)
+  trainer     StaffProfile? @relation(fields: [trainerId], references: [id], onDelete: SetNull)
+  enrollments Enrollment[]
+
+  @@index([programId])
+  @@index([intakeId])
+  @@index([trainerId])
+}
+
+model Enrollment {
+  id           String           @id @default(cuid())
+  studentId    String
+  programId    String
+  intakeId     String
+  classGroupId String?
+  status       EnrollmentStatus @default(ACTIVE)
+  enrolledAt   DateTime         @default(now())
+  completedAt  DateTime?
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+
+  student    StudentProfile @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  program    Program        @relation(fields: [programId], references: [id], onDelete: Restrict)
+  intake     Intake         @relation(fields: [intakeId], references: [id], onDelete: Restrict)
+  classGroup ClassGroup?    @relation(fields: [classGroupId], references: [id], onDelete: SetNull)
+
+  @@unique([studentId, intakeId])
+  @@index([studentId])
+  @@index([programId])
+  @@index([intakeId])
+  @@index([classGroupId])
+}
