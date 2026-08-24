@@ -8,7 +8,9 @@ import { AppModule } from './app.module';
 import { AllExceptionsFilter } from './common/filters/http-exception.filter';
 
 async function bootstrap(): Promise<void> {
-  const app = await NestFactory.create(AppModule, { bufferLogs: true });
+  // Not buffering logs: nothing here attaches a custom logger later, so
+  // buffering would only risk swallowing a fatal startup error.
+  const app = await NestFactory.create(AppModule);
   const configService = app.get(ConfigService);
 
   const nodeEnv = configService.get<string>('nodeEnv', 'development');
@@ -45,10 +47,13 @@ async function bootstrap(): Promise<void> {
     const swaggerConfig = new DocumentBuilder()
       .setTitle('SKAFF Academy API')
       .setDescription(
-        'Backend API for the SKAFF Academy digital campus platform. This is the foundation phase — only infrastructure endpoints are implemented so far.',
+        'Backend API for the SKAFF Academy digital campus platform. Backend Phase 1: programs discovery and authentication. Admissions and other business modules are not implemented yet.',
       )
       .setVersion('0.1.0')
       .addTag('Health', 'Application liveness')
+      .addTag('Programs', 'Public program catalog')
+      .addTag('Auth', 'Login and account identity')
+      .addBearerAuth()
       .build();
 
     const document = SwaggerModule.createDocument(app, swaggerConfig);

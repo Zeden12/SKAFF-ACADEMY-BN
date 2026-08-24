@@ -6,8 +6,9 @@ frontend and will eventually expose the APIs that frontend consumes for admissio
 student/staff accounts, programs, classes, materials, assignments, attendance,
 results, fees, documents, announcements, and notifications.
 
-> **Status: backend foundation only.** No business/domain modules are implemented
-> yet — see [Current Implementation Status](#current-implementation-status) and
+> **Status: Backend Phase 1.** Program discovery and authentication are
+> implemented. Admissions and every other business module are not — see
+> [Current Implementation Status](#current-implementation-status) and
 > [Planned Backend Modules](#planned-backend-modules) below.
 
 ## Relationship to SKAFF-ACADEMY (frontend)
@@ -26,31 +27,44 @@ are deployed and versioned independently but must stay aligned on domain vocabul
 - **API docs:** Swagger / OpenAPI (`@nestjs/swagger`)
 - **Validation:** `class-validator` / `class-transformer`
 - **Config:** `@nestjs/config`, validated at startup
+- **Auth:** JWT (`@nestjs/jwt`, Passport `passport-jwt`), passwords hashed with Argon2
 
 ## Architecture
 
 ```
 src/
   common/
-    enums/            Shared domain vocabulary (statuses, modes) — see Domain Contract
-    filters/           Global exception filter (consistent JSON error envelope)
+    enums/              Shared domain vocabulary (statuses, modes) — see Domain Contract
+    filters/             Global exception filter (consistent JSON error envelope)
   config/
-    configuration.ts   Typed accessor for env-derived app config
-    env.validation.ts  class-validator schema; fails fast on invalid/missing env vars
+    configuration.ts     Typed accessor for env-derived app config
+    env.validation.ts    class-validator schema; fails fast on invalid/missing env vars
   health/
-    health.controller.ts  GET /api/v1/health
-    health.module.ts
+    health.controller.ts    GET /api/v1/health
   prisma/
-    prisma.service.ts  Single shared PrismaClient (connect/disconnect lifecycle)
-    prisma.module.ts   @Global module exporting PrismaService
+    prisma.service.ts    Single shared PrismaClient (connect/disconnect lifecycle)
+    prisma.module.ts     @Global module exporting PrismaService
+  programs/
+    programs.controller.ts  GET /api/v1/programs, GET /api/v1/programs/:slug
+    programs.service.ts     All Prisma access for programs — controller never queries Prisma directly
+  auth/
+    auth.controller.ts   POST /auth/login, GET /auth/me, GET /auth/staff-only (demo)
+    auth.service.ts      Login, password verification, JWT signing, safe user projection
+    strategies/          Passport JwtStrategy (verifies bearer tokens)
+    guards/              JwtAuthGuard, UserTypesGuard (STUDENT/STAFF authorization)
+    decorators/          @CurrentUser(), @UserTypes(...)
+    dto/                 LoginDto, UserSummaryDto, LoginResponseDto, profile summaries
   app.module.ts
-  main.ts               Bootstrap: prefix, CORS, Helmet, ValidationPipe, Swagger
+  main.ts                 Bootstrap: prefix, CORS, Helmet, ValidationPipe, Swagger
 
 prisma/
-  schema.prisma          Datasource/generator only — no domain models yet
+  schema.prisma           User, StudentProfile, StaffProfile, Program, Intake, ClassGroup, Enrollment
+  seed.ts                 8 official programs + dev trainer/student accounts (see Seed Data)
 
 test/
   app.e2e-spec.ts         HTTP-layer e2e test (health + error envelope)
+  programs.e2e-spec.ts    Program listing/ordering, slug lookup, 404
+  auth.e2e-spec.ts        Login, /auth/me, invalid tokens, STUDENT/STAFF guard
 ```
 
 **Response convention:**
@@ -97,15 +111,18 @@ Copy `.env.example` to `.env` and fill in real values. Required variables are
 validated at startup (`src/config/env.validation.ts`) — the app will refuse to
 start if any are missing or malformed.
 
-| Variable       | Description                                            | Example                                                              |
-| -------------- | -------------------------------------------------------- | --------------------------------------------------------------------- |
-| `NODE_ENV`     | `development` \| `test` \| `staging` \| `production`      | `development`                                                         |
-| `PORT`         | HTTP port the API listens on                              | `3000`                                                                 |
-| `DATABASE_URL` | PostgreSQL connection string used by Prisma                | `postgresql://postgres:postgres@localhost:5432/skaff_academy?schema=public` |
-| `FRONTEND_URL` | Origin of the SKAFF-ACADEMY frontend, used for CORS        | `http://localhost:3001`                                               |
+| Variable         | Description                                             | Example                                                                     |
+| ---------------- | -------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `NODE_ENV`       | `development` \| `test` \| `staging` \| `production`      | `development`                                                                 |
+| `PORT`           | HTTP port the API listens on                              | `3000`                                                                        |
+| `DATABASE_URL`   | PostgreSQL connection string used by Prisma               | `postgresql://postgres:postgres@localhost:5432/skaff_academy?schema=public`  |
+| `FRONTEND_URL`   | Origin of the SKAFF-ACADEMY frontend, used for CORS       | `http://localhost:3001`                                                       |
+| `JWT_SECRET`     | Signing secret for access tokens. At least 16 characters. Generate a real, unique value per environment (e.g. `openssl rand -base64 48`) — never reuse the placeholder. | *(no default — required)* |
+| `JWT_EXPIRES_IN` | Access token lifetime (`jsonwebtoken`/`ms` duration string) | `1d`                                                                         |
 
 Never commit `.env` — it is gitignored. Only `.env.example` (with placeholder
-values) is committed.
+values) is committed. There is currently no refresh-token flow: when an access
+token expires the user simply logs in again.
 
 ## PostgreSQL Setup
 
@@ -126,18 +143,34 @@ npm run prisma:migrate:dev     # Create/apply a migration in development
 npm run prisma:migrate:deploy  # Apply pending migrations (CI/production)
 npm run prisma:validate        # Validate prisma/schema.prisma
 npm run prisma:studio          # Open Prisma Studio
+npx prisma db seed             # Run prisma/seed.ts (also runs automatically after `migrate dev`)
 ```
 
-The schema currently defines only the `datasource`/`generator` blocks — no
-domain models yet, so `prisma migrate dev` will produce an (initially empty)
-baseline migration. This is intentional: see
-[Planned Backend Modules](#planned-backend-modules).
-
 **Note:** `PrismaService` attempts to connect on application startup and logs
-an error if the database is unreachable, but it does **not** crash the process
-— no feature currently depends on the database, so there is nothing yet for an
-unavailable DB to break. This should be revisited (fail-fast, or a DB-aware
-readiness check) once the first persistence-dependent module ships.
+an error if the database is unreachable, but it does **not** crash the process.
+No route currently depends on a live DB connection at *startup* (though
+programs/auth routes will of course fail per-request without one). This should
+be revisited (fail-fast, or a DB-aware readiness check) as more of the
+platform comes to depend on persistence.
+
+### Database Models (current)
+
+`User`, `StudentProfile`, `StaffProfile`, `Program`, `Intake`, `ClassGroup`,
+`Enrollment` — see `prisma/schema.prisma` for fields/enums. The remaining
+entities in the [Domain Contract](#domain-contract) are not modeled yet.
+
+### Seed Data
+
+`prisma/seed.ts` is idempotent (safe to rerun) and creates/updates:
+
+- The 8 official SKAFF Academy programs, in their official display order
+  (see [Programs API](#programs-api)) — never reorder or replace this catalog.
+- One development trainer (STAFF) and one development student (STUDENT)
+  account — see [Authentication](#authentication) for their login credentials.
+- One development intake, class group, and enrollment linking that student to
+  Full-Stack Development, purely to exercise the relations above.
+
+None of the development accounts or academic records are real Academy data.
 
 ## Development Commands
 
@@ -159,7 +192,7 @@ npm run test:cov      # Unit tests with coverage
 
 With the app running in a non-production environment:
 
-- Swagger UI: `http://localhost:3000/api/docs`
+- Swagger UI: `http://localhost:3000/api/docs` (bearer-token auth supported — click **Authorize** and paste an access token)
 - OpenAPI JSON: `http://localhost:3000/api/docs-json`
 
 Swagger is not exposed when `NODE_ENV=production`.
@@ -174,12 +207,79 @@ GET /api/v1/health
 { "status": "ok", "timestamp": "2026-08-20T12:00:00.000Z", "environment": "development" }
 ```
 
+## Programs API
+
+Public, unauthenticated endpoints backed by `ProgramsService` (the controller
+never queries Prisma directly):
+
+```
+GET /api/v1/programs         → active programs, ordered by displayOrder ascending
+GET /api/v1/programs/:slug   → a single active program, or 404 if the slug doesn't exist / isn't active
+```
+
+The 8 programs and their official order (`displayOrder` 1–8): Video
+Production, Audio Production, Full-Stack Development, Backend Development,
+Frontend Development, UI/UX Design, Power of AI, Digital Marketing & Social
+Media Management. This order comes from seed data — see [Seed Data](#seed-data).
+
+## Authentication
+
+JWT bearer auth. Passwords are hashed with Argon2 (`argon2` package) — there
+are no plaintext passwords anywhere in the system.
+
+```
+POST /api/v1/auth/login   → { email, password } → { accessToken, user }
+GET  /api/v1/auth/me      → current user (requires Authorization: Bearer <token>)
+GET  /api/v1/auth/staff-only  → demo route restricted to STAFF, proves the UserTypes guard works
+```
+
+`user` in the login response (and the `/auth/me` response) never includes
+`passwordHash`, and includes `studentProfile`/`staffProfile` only for the
+matching account type (the other is `null`):
+
+```json
+{
+  "accessToken": "eyJhbGciOiJIUzI1NiIs...",
+  "user": {
+    "id": "cmt34z91h000dv70st8n4chga",
+    "email": "student@skaffacademy.local",
+    "userType": "STUDENT",
+    "isActive": true,
+    "studentProfile": { "id": "...", "studentNumber": "SKF-2026-0001", "fullName": "Aline Uwimana", "status": "ACTIVE" },
+    "staffProfile": null
+  }
+}
+```
+
+**Login failures are intentionally indistinguishable:** an unknown email, a
+wrong password, and a deactivated (`isActive: false`) account all return the
+same `401 { "message": "Invalid email or password" }` — this avoids leaking
+whether an email is registered or whether an account has been deactivated. A
+token also stops working immediately if the account is deactivated after it
+was issued, since `/auth/me` and every guarded route re-check `isActive` on
+every request rather than trusting the token's claims.
+
+**Authorization foundation:** `@UserTypes(UserType.STAFF)` (or `.STUDENT`),
+combined with `@UseGuards(JwtAuthGuard, UserTypesGuard)`, restricts a route to
+one or both account types. `GET /api/v1/auth/staff-only` is a minimal demo of
+this — repurpose or remove it once a real STAFF-only route exists. There is no
+finer-grained permission system yet (see [User Model / Account Rules](#domain-contract)).
+
+**Development login credentials** (seeded — never use in staging/production):
+
+| Role    | Email                          | Password        |
+| ------- | ------------------------------- | ---------------- |
+| STAFF   | `trainer@skaffacademy.local`    | `SkaffDev2026!`   |
+| STUDENT | `student@skaffacademy.local`    | `SkaffDev2026!`   |
+
 ## Domain Contract
 
 The SKAFF-ACADEMY frontend already uses the following entity names and status
-vocabularies. None of these are implemented as Prisma models yet, but future
-modules **must** use these exact names/values to stay aligned with the frontend
-— do not invent conflicting terminology.
+vocabularies. `User`, `StudentProfile`, `StaffProfile`, `Program`, `Intake`,
+`ClassGroup`, and `Enrollment` are now implemented as Prisma models
+(`prisma/schema.prisma`); the rest are not modeled yet. Future modules **must**
+use these exact names/values to stay aligned with the frontend — do not invent
+conflicting terminology.
 
 **Entities:** `User`, `StudentProfile`, `StaffProfile`, `Program`, `Intake`,
 `ClassGroup`, `Enrollment`, `Application`, `ApplicationDocument`, `Module`,
@@ -187,8 +287,9 @@ modules **must** use these exact names/values to stay aligned with the frontend
 `AttendanceRecord`, `Result`, `FeeRecord`, `PaymentTransaction`, `Announcement`,
 `DocumentRequest`, `Notification`.
 
-**Account families:** only `STUDENT` and `STAFF` (teachers and admins are both
-`STAFF`; finer-grained permissions can be layered on later).
+**Account families:** only `STUDENT` and `STAFF` (`UserType` enum — teachers
+and admins are both `STAFF`; there is deliberately no separate `ADMIN` type;
+finer-grained permissions can be layered on later via `@UserTypes(...)`).
 
 **Application statuses** (`src/common/enums/application-status.enum.ts`):
 `draft`, `submitted`, `under_review`, `more_information_required`, `approved`,
@@ -203,41 +304,47 @@ and `offsite` are the exception, not the default.
 
 ## Current Implementation Status
 
-Implemented (this phase — backend foundation only):
+Implemented (Backend Phase 1 — programs discovery + authentication, on top of
+the earlier infrastructure foundation):
 
 - NestJS project structure, strict TypeScript, ESLint + Prettier
-- Environment configuration with startup validation
-- Prisma wired to PostgreSQL (no domain models yet)
+- Environment configuration with startup validation (now includes `JWT_SECRET`/`JWT_EXPIRES_IN`)
+- Prisma wired to PostgreSQL: `User`, `StudentProfile`, `StaffProfile`, `Program`, `Intake`, `ClassGroup`, `Enrollment`
+- Idempotent seed script: 8 official programs + dev trainer/student accounts with real Argon2 password hashes
 - Global `/api/v1` prefix
 - `GET /api/v1/health`
+- **Programs API** — `GET /api/v1/programs`, `GET /api/v1/programs/:slug` (public, ordered, 404-safe)
+- **Authentication** — `POST /api/v1/auth/login`, `GET /api/v1/auth/me`, JWT bearer tokens, Argon2 password hashing
+- **Authorization foundation** — `@UserTypes(...)` + `UserTypesGuard` for STUDENT/STAFF-restricted routes
 - Global `ValidationPipe` (whitelist, forbidNonWhitelisted, transform)
 - Global exception filter with a consistent error envelope
 - CORS restricted to `FRONTEND_URL` (plus localhost in non-production)
 - Helmet security headers
-- Swagger/OpenAPI at `/api/docs` (non-production only)
-- Unit test (health controller) and e2e test (HTTP layer)
+- Swagger/OpenAPI at `/api/docs` (non-production only), with bearer-auth support
+- Unit tests (health controller, `UserTypesGuard`) and e2e tests (health, programs, auth)
 
-**Not implemented** (by design — future phases): authentication/JWT, users,
-students, staff management, admissions business logic, file uploads, programs
-CRUD, enrollments, classes, materials, assignments, attendance, grades,
-payments, documents, notifications.
+**Not implemented** (by design — future phases): admissions business logic,
+applicant documents, student conversion from application, staff management
+beyond the base account, classes/materials/assignments, attendance, results,
+fees/payments, document requests, announcements, notifications, file uploads,
+email/SMS, refresh-token rotation.
 
 ## Planned Backend Modules
 
-Suggested order for subsequent phases, based on the domain contract above:
+Suggested order for subsequent phases:
 
-1. **Auth & accounts** — `User`, STUDENT/STAFF account families, sessions/JWT
-2. **Programs & intakes** — `Program`, `Intake`, `Module`
-3. **Admissions** — `Application`, `ApplicationDocument`, application status
-   workflow
-4. **Students & staff profiles** — `StudentProfile`, `StaffProfile`
-5. **Classes & enrollment** — `ClassGroup`, `Enrollment`, `ClassSession`
-6. **Learning delivery** — `LearningMaterial`, `Assignment`, `Submission`
-7. **Attendance & results** — `AttendanceRecord`, `Result`
-8. **Fees & payments** — `FeeRecord`, `PaymentTransaction`
-9. **Documents & communication** — `DocumentRequest`, `Announcement`,
+1. **Admissions** — `Application`, `ApplicationDocument`, application status
+   workflow, converting an approved application into a `StudentProfile`
+2. **Staff & student management** — richer `StaffProfile`/`StudentProfile`
+   editing, staff permission granularity beyond STUDENT/STAFF
+3. **Classes & enrollment management** — richer `ClassGroup`/`Enrollment`
+   workflows, `ClassSession`
+4. **Learning delivery** — `LearningMaterial`, `Assignment`, `Submission`
+5. **Attendance & results** — `AttendanceRecord`, `Result`
+6. **Fees & payments** — `FeeRecord`, `PaymentTransaction`
+7. **Documents & communication** — `DocumentRequest`, `Announcement`,
    `Notification`
 
 Each phase should add the corresponding Prisma models/migrations, a feature
 module under `src/`, DTOs validated via `class-validator`, and Swagger
-annotations — following the conventions established in this foundation phase.
+annotations — following the conventions established so far.
