@@ -7,11 +7,19 @@ import {
   ClassStatus,
   EnrollmentStatus,
 } from '@prisma/client';
+import * as argon2 from 'argon2';
 
 const prisma = new PrismaClient();
 
+// Development-only login for both seeded accounts below. Never used in
+// staging/production — real accounts get real, unique passwords through the
+// (future) account-creation flow, not the seed script.
+const DEV_PASSWORD = 'SkaffDev2026!';
+
 async function main() {
   console.log('Seeding SKAFF Academy database...');
+
+  const devPasswordHash = await argon2.hash(DEV_PASSWORD);
 
   // =====================================================
   // REAL SKAFF ACADEMY PROGRAM CATALOG
@@ -109,18 +117,20 @@ async function main() {
 
   // =====================================================
   // DEVELOPMENT STAFF USER
-  // Not official Academy personnel.
-  // Used only to test relationships before real auth/users.
+  // Not official Academy personnel. Dev-only login, see README:
+  // trainer@skaffacademy.local / SkaffDev2026!
   // =====================================================
 
   const staffUser = await prisma.user.upsert({
     where: {
       email: 'trainer@skaffacademy.local',
     },
-    update: {},
+    update: {
+      passwordHash: devPasswordHash,
+    },
     create: {
       email: 'trainer@skaffacademy.local',
-      passwordHash: 'SEED_ONLY_NOT_REAL_PASSWORD',
+      passwordHash: devPasswordHash,
       userType: UserType.STAFF,
       isActive: true,
     },
@@ -184,16 +194,19 @@ async function main() {
 
   // =====================================================
   // DEVELOPMENT STUDENT
+  // Dev-only login, see README: student@skaffacademy.local / SkaffDev2026!
   // =====================================================
 
   const studentUser = await prisma.user.upsert({
     where: {
       email: 'student@skaffacademy.local',
     },
-    update: {},
+    update: {
+      passwordHash: devPasswordHash,
+    },
     create: {
       email: 'student@skaffacademy.local',
-      passwordHash: 'SEED_ONLY_NOT_REAL_PASSWORD',
+      passwordHash: devPasswordHash,
       userType: UserType.STUDENT,
       isActive: true,
     },
