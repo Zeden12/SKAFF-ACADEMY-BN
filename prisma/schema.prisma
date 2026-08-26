@@ -47,6 +47,45 @@ enum EnrollmentStatus {
   SUSPENDED
 }
 
+enum ApplicationStatus {
+  DRAFT
+  SUBMITTED
+  UNDER_REVIEW
+  MORE_INFORMATION_REQUIRED
+  APPROVED
+  REJECTED
+  ENROLLED
+}
+
+enum EducationLevel {
+  PRIMARY
+  SECONDARY
+  VOCATIONAL
+  DIPLOMA
+  BACHELORS
+  MASTERS
+  DOCTORATE
+  OTHER
+}
+
+enum ApplicationDocumentType {
+  IDENTIFICATION
+  PHOTO
+  ACADEMIC
+  ADDITIONAL
+}
+
+enum ApplicationHistoryActorType {
+  APPLICANT
+  STAFF
+  SYSTEM
+}
+
+enum ApplicationHistoryVisibility {
+  PUBLIC
+  INTERNAL
+}
+
 model User {
   id           String   @id @default(cuid())
   email        String   @unique
@@ -103,29 +142,36 @@ model Program {
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
-  intakes     Intake[]
-  classGroups ClassGroup[]
-  enrollments Enrollment[]
+  intakes      Intake[]
+  classGroups  ClassGroup[]
+  enrollments  Enrollment[]
+  applications Application[]
 
   @@index([displayOrder])
 }
 
 model Intake {
-  id               String       @id @default(cuid())
-  name             String
-  programId        String
-  status           IntakeStatus @default(UPCOMING)
-  applicationsOpen Boolean      @default(false)
-  startDate        DateTime?
-  endDate          DateTime?
-  createdAt        DateTime     @default(now())
-  updatedAt        DateTime     @updatedAt
+  id                 String       @id @default(cuid())
+  name               String
+  programId          String
+  status             IntakeStatus @default(UPCOMING)
+  applicationsOpen   Boolean      @default(false)
+  applicationOpenAt  DateTime?
+  applicationCloseAt DateTime?
+  capacity           Int?
+  startDate          DateTime?
+  endDate            DateTime?
+  createdAt          DateTime     @default(now())
+  updatedAt          DateTime     @updatedAt
 
-  program     Program      @relation(fields: [programId], references: [id], onDelete: Restrict)
-  classGroups ClassGroup[]
-  enrollments Enrollment[]
+  program      Program       @relation(fields: [programId], references: [id], onDelete: Restrict)
+  classGroups  ClassGroup[]
+  enrollments  Enrollment[]
+  applications Application[]
 
   @@index([programId])
+  @@index([status])
+  @@index([applicationsOpen])
 }
 
 model ClassGroup {
@@ -150,25 +196,122 @@ model ClassGroup {
 }
 
 model Enrollment {
-  id           String           @id @default(cuid())
-  studentId    String
-  programId    String
-  intakeId     String
-  classGroupId String?
-  status       EnrollmentStatus @default(ACTIVE)
-  enrolledAt   DateTime         @default(now())
-  completedAt  DateTime?
-  createdAt    DateTime         @default(now())
-  updatedAt    DateTime         @updatedAt
+  id            String           @id @default(cuid())
+  studentId     String
+  programId     String
+  intakeId      String
+  classGroupId  String?
+  applicationId String?          @unique
+  status        EnrollmentStatus @default(ACTIVE)
+  enrolledAt    DateTime         @default(now())
+  completedAt   DateTime?
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
 
-  student    StudentProfile @relation(fields: [studentId], references: [id], onDelete: Cascade)
-  program    Program        @relation(fields: [programId], references: [id], onDelete: Restrict)
-  intake     Intake         @relation(fields: [intakeId], references: [id], onDelete: Restrict)
-  classGroup ClassGroup?    @relation(fields: [classGroupId], references: [id], onDelete: SetNull)
+  student     StudentProfile @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  program     Program        @relation(fields: [programId], references: [id], onDelete: Restrict)
+  intake      Intake         @relation(fields: [intakeId], references: [id], onDelete: Restrict)
+  classGroup  ClassGroup?    @relation(fields: [classGroupId], references: [id], onDelete: SetNull)
+  application Application?   @relation(fields: [applicationId], references: [id], onDelete: SetNull)
 
   @@unique([studentId, intakeId])
   @@index([studentId])
   @@index([programId])
   @@index([intakeId])
   @@index([classGroupId])
+}
+
+// =====================================================
+// ADMISSIONS DOMAIN (Backend Phase 2)
+//
+// Program → Intake → Application → (approved) → explicit
+// enrollment conversion → User + StudentProfile + Enrollment.
+// Approval never auto-creates a student — see EnrollmentConversionService.
+// =====================================================
+
+model Application {
+  id        String            @id @default(cuid())
+  reference String            @unique
+  programId String
+  intakeId  String
+  status    ApplicationStatus @default(DRAFT)
+
+  // Personal information
+  fullName       String
+  email          String
+  phone          String
+  dateOfBirth    DateTime?
+  nationality    String?
+  currentAddress String?
+
+  // Education
+  highestEducationLevel EducationLevel?
+  previousInstitution   String?
+  fieldOfStudy          String?
+  completionYear        Int?
+  educationNotes        String?
+
+  // Operational
+  applicantFacingMessage String?
+  internalAdminNotes     String?
+  submittedAt            DateTime?
+  reviewedAt             DateTime?
+  approvedAt             DateTime?
+  rejectedAt             DateTime?
+  enrolledAt             DateTime?
+  createdAt              DateTime  @default(now())
+  updatedAt              DateTime  @updatedAt
+
+  program    Program                   @relation(fields: [programId], references: [id], onDelete: Restrict)
+  intake     Intake                    @relation(fields: [intakeId], references: [id], onDelete: Restrict)
+  documents  ApplicationDocument[]
+  history    ApplicationHistoryEntry[]
+  enrollment Enrollment?
+
+  @@index([email])
+  @@index([programId])
+  @@index([intakeId])
+  @@index([status])
+  @@index([submittedAt])
+}
+
+model ApplicationDocument {
+  id            String                  @id @default(cuid())
+  applicationId String
+  type          ApplicationDocumentType
+  fileName      String
+  mimeType      String
+  fileSize      Int
+  storageKey    String?
+  fileUrl       String?
+  createdAt     DateTime                @default(now())
+
+  application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@index([applicationId])
+}
+
+model ApplicationHistoryEntry {
+  id            String                       @id @default(cuid())
+  applicationId String
+  action        String
+  actorType     ApplicationHistoryActorType
+  actorName     String?
+  message       String?
+  visibility    ApplicationHistoryVisibility @default(INTERNAL)
+  createdAt     DateTime                     @default(now())
+
+  application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@index([applicationId])
+  @@index([createdAt])
+}
+
+// Generic atomic counter backing server-generated identifiers (application
+// references, student numbers, ...). One row per counter "key" (e.g.
+// `application-2026`); incremented via an atomic upsert, never read-then-write
+// from application code. See SequenceService.
+model SequenceCounter {
+  key   String @id
+  value Int    @default(0)
 }

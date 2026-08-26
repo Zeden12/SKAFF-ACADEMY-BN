@@ -6,8 +6,10 @@ frontend and will eventually expose the APIs that frontend consumes for admissio
 student/staff accounts, programs, classes, materials, assignments, attendance,
 results, fees, documents, announcements, and notifications.
 
-> **Status: Backend Phase 1.** Program discovery and authentication are
-> implemented. Admissions and every other business module are not — see
+> **Status: Backend Phase 2.** Program discovery, authentication, intakes, and
+> the full admissions/admissions-review/enrollment-conversion workflow are
+> implemented. Academic delivery (materials, assignments, attendance,
+> results), fees, and communications are not — see
 > [Current Implementation Status](#current-implementation-status) and
 > [Planned Backend Modules](#planned-backend-modules) below.
 
@@ -54,17 +56,36 @@ src/
     guards/              JwtAuthGuard, UserTypesGuard (STUDENT/STAFF authorization)
     decorators/          @CurrentUser(), @UserTypes(...)
     dto/                 LoginDto, UserSummaryDto, LoginResponseDto, profile summaries
+  intakes/
+    intakes.service.ts        Public "current eligible intake" lookup + STAFF admin CRUD
+    admin-intakes.controller.ts  /admin/intakes (STAFF only)
+    intake-eligibility.util.ts   Single source of truth for "is this intake open" — see Intakes API
+  applications/
+    applications.controller.ts       Public applicant-facing endpoints (/applications)
+    applications.service.ts          Shared lookups, applicant self-service, response mapping
+    admin-applications.controller.ts /admin/applications (STAFF only)
+    admin-applications.service.ts    Queue/detail/review actions
+    enrollment-conversion.service.ts APPROVED → User + StudentProfile + Enrollment (transactional)
+    application-status.policy.ts     Central state-transition table — see State Machine
+    application-history.util.ts      Shapes ApplicationHistoryEntry rows (PUBLIC/INTERNAL)
+    dto/                             ~15 request/response DTOs — see Applications API
   app.module.ts
   main.ts                 Bootstrap: prefix, CORS, Helmet, ValidationPipe, Swagger
 
 prisma/
-  schema.prisma           User, StudentProfile, StaffProfile, Program, Intake, ClassGroup, Enrollment
-  seed.ts                 8 official programs + dev trainer/student accounts (see Seed Data)
+  schema.prisma           User, StudentProfile, StaffProfile, Program, Intake, ClassGroup,
+                           Enrollment, Application, ApplicationDocument, ApplicationHistoryEntry,
+                           SequenceCounter
+  seed.ts                 8 official programs + dev accounts + 7 demo applications (see Seed Data)
 
 test/
-  app.e2e-spec.ts         HTTP-layer e2e test (health + error envelope)
-  programs.e2e-spec.ts    Program listing/ordering, slug lookup, 404
-  auth.e2e-spec.ts        Login, /auth/me, invalid tokens, STUDENT/STAFF guard
+  app.e2e-spec.ts               HTTP-layer e2e test (health + error envelope)
+  programs.e2e-spec.ts          Program listing/ordering, slug lookup, 404
+  auth.e2e-spec.ts              Login, /auth/me, invalid tokens, STUDENT/STAFF guard
+  intakes.e2e-spec.ts           Current-intake lookup, admin intake CRUD, STAFF protection
+  applications.e2e-spec.ts      Public application create/update/submit, intake-eligibility
+                                 rejections, applicant verification
+  admin-applications.e2e-spec.ts Review lifecycle, state machine, enrollment conversion
 ```
 
 **Response convention:**
@@ -156,8 +177,13 @@ platform comes to depend on persistence.
 ### Database Models (current)
 
 `User`, `StudentProfile`, `StaffProfile`, `Program`, `Intake`, `ClassGroup`,
-`Enrollment` — see `prisma/schema.prisma` for fields/enums. The remaining
+`Enrollment`, `Application`, `ApplicationDocument`, `ApplicationHistoryEntry`,
+`SequenceCounter` — see `prisma/schema.prisma` for fields/enums. The remaining
 entities in the [Domain Contract](#domain-contract) are not modeled yet.
+
+`SequenceCounter` is a generic atomic counter (one row per key, e.g.
+`application-2026`) backing server-generated identifiers — see
+[Application Reference & Student Number Generation](#application-reference--student-number-generation).
 
 ### Seed Data
 
@@ -167,10 +193,20 @@ entities in the [Domain Contract](#domain-contract) are not modeled yet.
   (see [Programs API](#programs-api)) — never reorder or replace this catalog.
 - One development trainer (STAFF) and one development student (STUDENT)
   account — see [Authentication](#authentication) for their login credentials.
-- One development intake, class group, and enrollment linking that student to
-  Full-Stack Development, purely to exercise the relations above.
+- One development intake (`applicationsOpen: true`, so the public admissions
+  flow can be exercised end-to-end), class group, and enrollment linking that
+  student to Full-Stack Development.
+- 7 development applications against that intake, one per `ApplicationStatus`
+  value (`DRAFT` … `ENROLLED`), each with a realistic history trail — see
+  `SKA-APP-2026-9001` through `9007` in `prisma/seed.ts`. The `ENROLLED` row
+  (`9007`) is a display-only demo: unlike a real `/enroll` call, it does not
+  wire up an actual `User`/`StudentProfile`/`Enrollment` chain.
 
-None of the development accounts or academic records are real Academy data.
+Seed/demo references and student numbers deliberately use the `9000+` range
+(`SKA-APP-2026-9001`, `SKF-2026-9000`) so they can never collide with the real
+`SequenceCounter`-generated values, which start at `0001` each year.
+
+None of the development accounts, intakes, or applications are real Academy data.
 
 ## Development Commands
 
@@ -245,7 +281,7 @@ matching account type (the other is `null`):
     "email": "student@skaffacademy.local",
     "userType": "STUDENT",
     "isActive": true,
-    "studentProfile": { "id": "...", "studentNumber": "SKF-2026-0001", "fullName": "Aline Uwimana", "status": "ACTIVE" },
+    "studentProfile": { "id": "...", "studentNumber": "SKF-2026-9000", "fullName": "Aline Uwimana", "status": "ACTIVE" },
     "staffProfile": null
   }
 }
@@ -272,14 +308,206 @@ finer-grained permission system yet (see [User Model / Account Rules](#domain-co
 | STAFF   | `trainer@skaffacademy.local`    | `SkaffDev2026!`   |
 | STUDENT | `student@skaffacademy.local`    | `SkaffDev2026!`   |
 
+## Intakes API
+
+The canonical academic relationship: **Program → Intake → Application →
+(approved) → explicit enrollment conversion → User + StudentProfile →
+Enrollment**. An `Intake` belongs to exactly one `Program`.
+
+Public:
+
+```
+GET /api/v1/programs/:slug/intakes/current
+```
+
+Always returns `200`. There is deliberately no "closed" error response — the
+frontend Apply button stays visible regardless of intake state, so this
+endpoint returns a display-ready result either way:
+
+```json
+// An intake is open
+{ "available": true, "intake": { "id": "...", "name": "...", "applicationsOpen": true, ... }, "message": null }
+
+// No intake currently accepts applications
+{ "available": false, "intake": null, "message": "Applications are currently closed for this program." }
+```
+
+"Current" means the most recently created intake (`createdAt` desc) among
+those where `applicationsOpen = true`, `status` is not `COMPLETED`/`CANCELLED`,
+`applicationOpenAt` (if set) has passed, and `applicationCloseAt` (if set)
+hasn't — see `intake-eligibility.util.ts`. This same rule is re-checked
+server-side on every application creation; the frontend fetching this
+endpoint moments earlier is never trusted on its own.
+
+STAFF only (`@ApiBearerAuth`, `UserTypes(STAFF)`):
+
+```
+GET    /api/v1/admin/intakes                          filters: programId, status, applicationsOpen
+POST   /api/v1/admin/intakes
+GET    /api/v1/admin/intakes/:id
+PATCH  /api/v1/admin/intakes/:id                       programId is immutable after creation
+PATCH  /api/v1/admin/intakes/:id/applications/open
+PATCH  /api/v1/admin/intakes/:id/applications/close
+```
+
+There is intentionally no delete endpoint — an `Intake` may already be
+referenced by `Application`/`ClassGroup`/`Enrollment` rows, and Prisma's
+`onDelete: Restrict` on those relations backs this up at the DB level.
+
+## Applications API
+
+Applicants need **no account** — an `Application` is a standalone record
+(`fullName`/`email`/`phone`/education fields), not tied to a `User` until
+[enrollment conversion](#enrollment-conversion). "Applicants are not Students
+yet" holds all the way through `APPROVED`.
+
+```
+POST   /api/v1/applications                    create a DRAFT
+PATCH  /api/v1/applications/:reference          edit (DRAFT or MORE_INFORMATION_REQUIRED only)
+POST   /api/v1/applications/:reference/submit   DRAFT → SUBMITTED
+GET    /api/v1/applications/:reference/status   read-only, applicant-safe view
+POST   /api/v1/applications/:reference/resubmit MORE_INFORMATION_REQUIRED → SUBMITTED
+POST   /api/v1/applications/:reference/documents  attach document metadata (no file storage yet)
+```
+
+Creation verifies the `Program` is active, resolves/re-verifies the `Intake`
+belongs to that program and [currently accepts applications](#intakes-api),
+generates the `reference` server-side, and starts the record as `DRAFT`.
+Submission additionally requires `highestEducationLevel`, `previousInstitution`,
+and `completionYear` to be filled in (a `400` lists whichever are still
+missing) — everything else stays optional through submission.
+
+Every one of these endpoints returns the same `ApplicantApplicationViewDto`
+shape: personal + education fields, `program`/`intake`, `documents`, `canUpdate`/
+`canResubmit` flags, and **PUBLIC-only** history — never `internalAdminNotes`,
+never an `INTERNAL` history entry, regardless of what staff have written
+internally about the application.
+
+### Applicant verification (interim, pre-auth)
+
+A `reference` (`SKA-APP-2026-0001`) is not a secret — it is not treated as
+authentication on its own. Every endpoint above except creation itself
+requires `verificationEmail` (body field, or query param for the `GET
+.../status` request) matching the application's current `email`. A wrong
+email and a nonexistent reference return the **identical** `404`, so guessing
+a reference can't be used to confirm it exists or to probe someone else's
+data.
+
+This is a deliberately lightweight, interim mechanism — there is no OTP or
+email-confirmation link yet. It should be replaced by real applicant
+authentication/secure tracking in a future phase; until then, treat
+`verificationEmail` as "proof you know the email," not as a password.
+
+### State machine
+
+Enforced centrally in `application-status.policy.ts` — every status change in
+every service goes through `assertValidTransition`, so the rules can't drift
+between call sites:
+
+```
+DRAFT                     → SUBMITTED
+SUBMITTED                 → UNDER_REVIEW
+UNDER_REVIEW               → MORE_INFORMATION_REQUIRED | APPROVED | REJECTED
+MORE_INFORMATION_REQUIRED → SUBMITTED
+APPROVED                   → ENROLLED   (only via enrollment conversion)
+REJECTED, ENROLLED          (terminal)
+```
+
+`REJECTED → APPROVED` and `ENROLLED → UNDER_REVIEW` are structurally
+impossible, not just discouraged. Applicants have no endpoint capable of
+setting `APPROVED` or `ENROLLED` — only the STAFF-only admin API can.
+
+## Admin Admissions API
+
+STAFF only (`@ApiBearerAuth`, `UserTypes(STAFF)`):
+
+```
+GET   /api/v1/admin/applications                        search, status, programId, intakeId, page, pageSize, sortBy, sortDir
+GET   /api/v1/admin/applications/:reference              full detail: internal notes, full history, enrollmentReadiness
+PATCH /api/v1/admin/applications/:reference/under-review SUBMITTED → UNDER_REVIEW
+POST  /api/v1/admin/applications/:reference/request-information  UNDER_REVIEW → MORE_INFORMATION_REQUIRED (message required)
+POST  /api/v1/admin/applications/:reference/approve       UNDER_REVIEW → APPROVED (does NOT create a student)
+POST  /api/v1/admin/applications/:reference/reject        UNDER_REVIEW → REJECTED (applicant-facing message required)
+PATCH /api/v1/admin/applications/:reference/internal-notes  replace internal notes (never shown to the applicant)
+POST  /api/v1/admin/applications/:reference/enroll        APPROVED → ENROLLED — see Enrollment Conversion
+```
+
+The list endpoint returns `counts` — a breakdown by every `ApplicationStatus`
+computed from the *other* active filters (search/program/intake) via a
+Postgres `groupBy`, so an admin dashboard can render status tabs with live
+counts without a second request.
+
+## Enrollment Conversion
+
+Approving an application (`UNDER_REVIEW → APPROVED`) **never** automatically
+creates a `User`, `StudentProfile`, or `Enrollment` — it only marks the
+application "ready for enrollment" (`enrollmentReadiness: true` in the admin
+detail view). Conversion is a deliberate, separate STAFF action:
+
+```
+POST /api/v1/admin/applications/:reference/enroll
+Body: { "classGroupId"?: string }
+```
+
+Inside one Prisma transaction:
+
+1. Re-checks the application is still `APPROVED` (closes the race window
+   between an earlier read and this write).
+2. If `classGroupId` is given, verifies it belongs to the *same* `Program`
+   **and** `Intake` as the application — a mismatched class group is a `400`,
+   never silently ignored. Omit it to leave the enrollment unassigned for a
+   staff member to assign a class group later.
+3. Resolves a `User` by the application's email: reuses an existing
+   `STUDENT` account (and its `StudentProfile`, if a returning applicant
+   already has one — never duplicated or overwritten), rejects with `409` if
+   the email belongs to a `STAFF` account, or creates a new `User`.
+4. A newly created `User` is **inactive** (`isActive: false`) with an
+   Argon2 hash of random bytes as its password — not a guessable default,
+   not emailed anywhere (no email flow exists yet). It cannot log in until a
+   future account-activation flow (email verification + real password set)
+   flips `isActive` to `true`. `StudentProfile.status` is set to `ACTIVE`
+   immediately, though — that field tracks academic standing, which is
+   independent of login-credential activation.
+5. Creates the `Enrollment` (`Program`/`Intake`/optional `ClassGroup`,
+   linked back to the `Application` via a unique `applicationId`).
+6. Marks the `Application` `ENROLLED`, sets `enrolledAt`, and appends a
+   `PUBLIC` history entry.
+
+Re-running `/enroll` on an already-converted application is rejected —
+first by the status check (no longer `APPROVED`), and, as a second line of
+defense against a genuine race between two concurrent requests, by the
+database-level unique constraint on `Enrollment.applicationId`.
+
+### Application reference & student number generation
+
+Both are generated server-side — never trusted from the client — via
+`SequenceService` (`src/prisma/sequence.service.ts`), which atomically
+increments a row in the generic `SequenceCounter` table with a single
+`INSERT … ON CONFLICT DO UPDATE … RETURNING` statement (safe under
+concurrent requests; no read-then-write race). The counter increment happens
+inside the same transaction as the row it numbers, so a failed application
+creation or enrollment conversion never burns a number.
+
+```
+Application reference:  SKA-APP-{year}-{seq}   e.g. SKA-APP-2026-0001
+Student number:         SKF-{year}-{seq}       e.g. SKF-2026-0001
+```
+
+Formatting lives entirely in `SequenceService`, so the pattern can change
+later without touching any calling code.
+
 ## Domain Contract
 
 The SKAFF-ACADEMY frontend already uses the following entity names and status
 vocabularies. `User`, `StudentProfile`, `StaffProfile`, `Program`, `Intake`,
-`ClassGroup`, and `Enrollment` are now implemented as Prisma models
-(`prisma/schema.prisma`); the rest are not modeled yet. Future modules **must**
-use these exact names/values to stay aligned with the frontend — do not invent
-conflicting terminology.
+`ClassGroup`, `Enrollment`, `Application`, and `ApplicationDocument` are now
+implemented as Prisma models (`prisma/schema.prisma`); the rest are not
+modeled yet. Future modules **must** use these exact names/values to stay
+aligned with the frontend — do not invent conflicting terminology.
+
+`ApplicationHistoryEntry` and `SequenceCounter` are backend-only
+implementation details (audit trail, id generation) with no direct frontend
+equivalent, so they aren't part of this contract.
 
 **Entities:** `User`, `StudentProfile`, `StaffProfile`, `Program`, `Intake`,
 `ClassGroup`, `Enrollment`, `Application`, `ApplicationDocument`, `Module`,
@@ -291,9 +519,9 @@ conflicting terminology.
 and admins are both `STAFF`; there is deliberately no separate `ADMIN` type;
 finer-grained permissions can be layered on later via `@UserTypes(...)`).
 
-**Application statuses** (`src/common/enums/application-status.enum.ts`):
-`draft`, `submitted`, `under_review`, `more_information_required`, `approved`,
-`rejected`, `enrolled`.
+**Application statuses** (`ApplicationStatus` Prisma enum — see
+[State machine](#state-machine)): `DRAFT`, `SUBMITTED`, `UNDER_REVIEW`,
+`MORE_INFORMATION_REQUIRED`, `APPROVED`, `REJECTED`, `ENROLLED`.
 
 **Student statuses** (`src/common/enums/student-status.enum.ts`): `active`,
 `pending_payment`, `on_hold`, `suspended`, `completed`, `withdrawn`.
@@ -304,45 +532,59 @@ and `offsite` are the exception, not the default.
 
 ## Current Implementation Status
 
-Implemented (Backend Phase 1 — programs discovery + authentication, on top of
-the earlier infrastructure foundation):
+Implemented (Backend Phase 2 — intakes, admissions, and enrollment
+conversion, on top of Phase 1's programs/auth foundation):
 
 - NestJS project structure, strict TypeScript, ESLint + Prettier
-- Environment configuration with startup validation (now includes `JWT_SECRET`/`JWT_EXPIRES_IN`)
-- Prisma wired to PostgreSQL: `User`, `StudentProfile`, `StaffProfile`, `Program`, `Intake`, `ClassGroup`, `Enrollment`
-- Idempotent seed script: 8 official programs + dev trainer/student accounts with real Argon2 password hashes
+- Environment configuration with startup validation (`JWT_SECRET`/`JWT_EXPIRES_IN`)
+- Prisma wired to PostgreSQL: `User`, `StudentProfile`, `StaffProfile`, `Program`, `Intake`,
+  `ClassGroup`, `Enrollment`, `Application`, `ApplicationDocument`, `ApplicationHistoryEntry`,
+  `SequenceCounter`
+- Idempotent seed script: 8 official programs, dev accounts, and 7 demo applications
+  covering every `ApplicationStatus`
 - Global `/api/v1` prefix
 - `GET /api/v1/health`
 - **Programs API** — `GET /api/v1/programs`, `GET /api/v1/programs/:slug` (public, ordered, 404-safe)
 - **Authentication** — `POST /api/v1/auth/login`, `GET /api/v1/auth/me`, JWT bearer tokens, Argon2 password hashing
 - **Authorization foundation** — `@UserTypes(...)` + `UserTypesGuard` for STUDENT/STAFF-restricted routes
+- **Intakes API** — public "current eligible intake" lookup, STAFF admin CRUD + open/close actions
+- **Applications API** — public applicant self-service (create/update/submit/status/resubmit/documents),
+  interim `verificationEmail` applicant verification, server-generated references
+- **Admin Admissions API** — queue with search/filters/pagination/status counts, full detail,
+  review actions (under-review/request-information/approve/reject/internal-notes)
+- **Enrollment conversion** — transactional `APPROVED → ENROLLED`, creates/resolves
+  `User` + `StudentProfile` + `Enrollment`, server-generated student numbers,
+  duplicate-conversion and mismatched-class-group protection
+- **Central state-transition policy** — every status change is validated centrally,
+  never duplicated per call site
 - Global `ValidationPipe` (whitelist, forbidNonWhitelisted, transform)
 - Global exception filter with a consistent error envelope
 - CORS restricted to `FRONTEND_URL` (plus localhost in non-production)
 - Helmet security headers
 - Swagger/OpenAPI at `/api/docs` (non-production only), with bearer-auth support
-- Unit tests (health controller, `UserTypesGuard`) and e2e tests (health, programs, auth)
+- Unit tests (health controller, `UserTypesGuard`, state-transition policy, intake eligibility)
+  and e2e tests (health, programs, auth, intakes, public applications, admin applications +
+  enrollment) — 71 tests total
 
-**Not implemented** (by design — future phases): admissions business logic,
-applicant documents, student conversion from application, staff management
-beyond the base account, classes/materials/assignments, attendance, results,
-fees/payments, document requests, announcements, notifications, file uploads,
-email/SMS, refresh-token rotation.
+**Not implemented** (by design — future phases): academic delivery (modules,
+schedule/sessions, materials, assignments, submissions, attendance, formal
+results), fees/payments, student document requests, announcements,
+notifications, email/SMS, cloud file storage (document metadata only —
+no real upload yet), real admission-letter PDFs, refresh-token rotation.
 
 ## Planned Backend Modules
 
 Suggested order for subsequent phases:
 
-1. **Admissions** — `Application`, `ApplicationDocument`, application status
-   workflow, converting an approved application into a `StudentProfile`
-2. **Staff & student management** — richer `StaffProfile`/`StudentProfile`
-   editing, staff permission granularity beyond STUDENT/STAFF
-3. **Classes & enrollment management** — richer `ClassGroup`/`Enrollment`
-   workflows, `ClassSession`
-4. **Learning delivery** — `LearningMaterial`, `Assignment`, `Submission`
-5. **Attendance & results** — `AttendanceRecord`, `Result`
-6. **Fees & payments** — `FeeRecord`, `PaymentTransaction`
-7. **Documents & communication** — `DocumentRequest`, `Announcement`,
+1. **Academic delivery** — `Module`, `ClassSession` (schedule), `LearningMaterial`,
+   `Assignment`, `Submission`
+2. **Attendance & results** — `AttendanceRecord`, `Result`
+3. **Staff & student management** — richer `StaffProfile`/`StudentProfile`
+   editing, staff permission granularity beyond STUDENT/STAFF, the
+   account-activation flow enrollment conversion currently defers
+   (email verification + real password set for newly created student accounts)
+4. **Fees & payments** — `FeeRecord`, `PaymentTransaction`
+5. **Documents & communication** — `DocumentRequest`, `Announcement`,
    `Notification`
 
 Each phase should add the corresponding Prisma models/migrations, a feature
