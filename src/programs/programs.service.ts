@@ -25,4 +25,16 @@ export class ProgramsService {
 
     return program;
   }
+
+  async findActiveById(id: string): Promise<Program> {
+    const program = await this.prisma.program.findFirst({
+      where: { id, isActive: true },
+    });
+
+    if (!program) {
+      throw new NotFoundException(`Program "${id}" was not found or is not active`);
+    }
+
+    return program;
+  }
 }
